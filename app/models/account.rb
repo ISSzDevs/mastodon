@@ -432,73 +432,73 @@ class Account < ApplicationRecord
       DeliveryFailureTracker.without_unavailable(urls)
     end
 
+    DISALLOWED_TSQUERY_CHARACTERS = /['?\\:‘’]/.freeze
+
     def search_for(terms, limit = 10, offset = 0)
-      textsearch, query = generate_query_for_search(terms)
+      prepared_terms = [
+        Arel::Nodes.build_quoted("' "),
+        Arel::Nodes.build_quoted(terms.gsub(DISALLOWED_TSQUERY_CHARACTERS, ' ')),
+        Arel::Nodes.build_quoted(" '"),
+        Arel::Nodes.build_quoted(':*'),
+      ].inject { |memo, term| Arel::Nodes::Concat.new(memo, term) }
 
-      sql = <<-SQL.squish
-        SELECT
-          accounts.*,
-          ts_rank_cd(#{textsearch}, #{query}, 32) AS rank
-        FROM accounts
-        WHERE #{query} @@ #{textsearch}
-          AND accounts.suspended_at IS NULL
-          AND accounts.moved_to_account_id IS NULL
-        ORDER BY rank DESC
-        LIMIT ? OFFSET ?
-      SQL
+      language            = Arel::Nodes.build_quoted('simple')
+      display_name_vector = Arel::Nodes::NamedFunction.new('setweight', [Arel::Nodes::NamedFunction.new('to_tsvector', [language, Account.arel_table[:display_name]]), Arel::Nodes.build_quoted('A')])
+      username_vector     = Arel::Nodes::NamedFunction.new('setweight', [Arel::Nodes::NamedFunction.new('to_tsvector', [language, Account.arel_table[:username]]), Arel::Nodes.build_quoted('B')])
+      domain_vector       = Arel::Nodes::NamedFunction.new('setweight', [Arel::Nodes::NamedFunction.new('to_tsvector', [language, Arel::Nodes::NamedFunction.new('coalesce', [Account.arel_table[:domain], Arel::Nodes.build_quoted('')])]), Arel::Nodes.build_quoted('C')])
 
-      records = find_by_sql([sql, limit, offset])
-      ActiveRecord::Associations::Preloader.new.preload(records, :account_stat)
-      records
+      description_vector = Arel::Nodes::Grouping.new(Arel::Nodes::Concat.new(display_name_vector, Arel::Nodes::Concat.new(username_vector, domain_vector)))
+      query_vector       = Arel::Nodes::NamedFunction.new('to_tsquery', [language, prepared_terms])
+
+      rank = Arel::Nodes::NamedFunction.new('ts_rank_cd', [description_vector, query_vector, 32])
+
+      select([arel_table[Arel.star], rank.as('rank')])
+        .where(Arel::Nodes::InfixOperation.new('@@', description_vector, query_vector))
+        .searchable
+        .includes(:account_stat)
+        .order(rank: :desc)
+        .limit(limit)
+        .offset(offset)
     end
 
     def advanced_search_for(terms, account, limit = 10, following = false, offset = 0)
-      textsearch, query = generate_query_for_search(terms)
+      prepared_terms = [
+        Arel::Nodes.build_quoted("' "),
+        Arel::Nodes.build_quoted(terms.gsub(DISALLOWED_TSQUERY_CHARACTERS, ' ')),
+        Arel::Nodes.build_quoted(" '"),
+        Arel::Nodes.build_quoted(':*'),
+      ].inject { |memo, term| Arel::Nodes::Concat.new(memo, term) }
+
+      language            = Arel::Nodes.build_quoted('simple')
+      display_name_vector = Arel::Nodes::NamedFunction.new('setweight', [Arel::Nodes::NamedFunction.new('to_tsvector', [language, Account.arel_table[:display_name]]), Arel::Nodes.build_quoted('A')])
+      username_vector     = Arel::Nodes::NamedFunction.new('setweight', [Arel::Nodes::NamedFunction.new('to_tsvector', [language, Account.arel_table[:username]]), Arel::Nodes.build_quoted('B')])
+      domain_vector       = Arel::Nodes::NamedFunction.new('setweight', [Arel::Nodes::NamedFunction.new('to_tsvector', [language, Arel::Nodes::NamedFunction.new('coalesce', [Account.arel_table[:domain], Arel::Nodes.build_quoted('')])]), Arel::Nodes.build_quoted('C')])
+
+      description_vector = Arel::Nodes::Grouping.new(Arel::Nodes::Concat.new(display_name_vector, Arel::Nodes::Concat.new(username_vector, domain_vector)))
+      query_vector       = Arel::Nodes::NamedFunction.new('to_tsquery', [language, prepared_terms])
+
+      rank          = Arel::Nodes::NamedFunction.new('ts_rank_cd', [description_vector, query_vector, 32])
+      weighted_rank = Arel::Nodes::Multiplication.new(Arel::Nodes::Addition.new(Follow.arel_table[:id].count, 1), rank)
+
+      scope = select([arel_table[Arel.star], weighted_rank.as('rank')])
+                .where(Arel::Nodes::InfixOperation.new('@@', description_vector, query_vector))
+                .searchable
+                .joins(arel_table.join(Follow.arel_table, Arel::Nodes::OuterJoin).on(arel_table[:id].eq(Follow.arel_table[:account_id]).and(Follow.arel_table[:target_account_id].eq(account.id))).join_sources)
+                .includes(:account_stat)
+                .order(rank: :desc)
+                .group(arel_table[:id])
+                .limit(limit)
+                .offset(offset)
 
       if following
-        sql = <<-SQL.squish
-          WITH first_degree AS (
-            SELECT target_account_id
-            FROM follows
-            WHERE account_id = ?
-            UNION ALL
-            SELECT ?
-          )
-          SELECT
-            accounts.*,
-            (count(f.id) + 1) * ts_rank_cd(#{textsearch}, #{query}, 32) AS rank
-          FROM accounts
-          LEFT OUTER JOIN follows AS f ON (accounts.id = f.account_id AND f.target_account_id = ?)
-          WHERE accounts.id IN (SELECT * FROM first_degree)
-            AND #{query} @@ #{textsearch}
-            AND accounts.suspended_at IS NULL
-            AND accounts.moved_to_account_id IS NULL
-          GROUP BY accounts.id
-          ORDER BY rank DESC
-          LIMIT ? OFFSET ?
-        SQL
+        first_degree_table = Arel::Table.new(:first_degree)
+        first_degree_cte   = Arel::Nodes::As.new(first_degree_table, Follow.select(:target_account_id).where(account_id: account.id).arel.union(:all, Arel::SelectManager.new.project(Arel::Nodes.build_quoted(account.id))))
 
-        records = find_by_sql([sql, account.id, account.id, account.id, limit, offset])
-      else
-        sql = <<-SQL.squish
-          SELECT
-            accounts.*,
-            (count(f.id) + 1) * ts_rank_cd(#{textsearch}, #{query}, 32) AS rank
-          FROM accounts
-          LEFT OUTER JOIN follows AS f ON (accounts.id = f.account_id AND f.target_account_id = ?) OR (accounts.id = f.target_account_id AND f.account_id = ?)
-          WHERE #{query} @@ #{textsearch}
-            AND accounts.suspended_at IS NULL
-            AND accounts.moved_to_account_id IS NULL
-          GROUP BY accounts.id
-          ORDER BY rank DESC
-          LIMIT ? OFFSET ?
-        SQL
-
-        records = find_by_sql([sql, account.id, account.id, limit, offset])
+        scope = scope.where(arel_table[:id].in(first_degree_table.project('*')))
+                     .with(first_degree_cte)
       end
 
-      ActiveRecord::Associations::Preloader.new.preload(records, :account_stat)
-      records
+      scope
     end
 
     def from_text(text)
@@ -512,18 +512,9 @@ class Account < ApplicationRecord
             TagManager.instance.normalize_domain(domain)
           end
         end
+
         EntityCache.instance.mention(username, domain)
       end
-    end
-
-    private
-
-    def generate_query_for_search(terms)
-      terms      = Arel.sql(connection.quote(terms.gsub(/['?\\:]/, ' ')))
-      textsearch = "(setweight(to_tsvector('simple', accounts.display_name), 'A') || setweight(to_tsvector('simple', accounts.username), 'B') || setweight(to_tsvector('simple', coalesce(accounts.domain, '')), 'C'))"
-      query      = "to_tsquery('simple', ''' ' || #{terms} || ' ''' || ':*')"
-
-      [textsearch, query]
     end
   end
 
